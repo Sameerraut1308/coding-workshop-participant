@@ -4,8 +4,14 @@ An end-to-end **Bronze → Silver → Gold** data pipeline (Python / pandas) tha
 (PostgreSQL tables + raw learning-activity event files) into trusted, queryable Gold tables, and a Jupyter
 notebook that answers the seven business questions with charts and plain-English findings.
 
+**It runs locally and in AWS EKS.** Locally it uses PostgreSQL + LocalStack S3. In AWS it ran as the EKS job
+`coding-workshop-talent-pipeline` against Aurora PostgreSQL and the real S3 lake bucket on 2026-10-15
+(run `20261015T152846Z-d2be7505`): `status: success`, 30/30 reconciliation checks, 2 min 54 s, all 10 Gold tables
+published (see *Cloud deployment status*).
+
 | | |
 |---|---|
+| **Where it runs** | Locally (PostgreSQL + LocalStack Pro S3) **and** in AWS (EKS job → Aurora PostgreSQL + S3) — both succeed with 30/30 reconciliation |
 | **Run everything** | `bash scripts/run_all.sh` |
 | **Pipeline only** | `python job.py` |
 | **Insights** | `notebooks/talent_insights.ipynb` (pre-rendered copy: `notebooks/talent_insights.html`) |
@@ -77,7 +83,7 @@ All Gold tables are built from one conformed table, `gold_employee_360` (one row
   so time-bounded reads touch only the needed folders. Small dimension tables are single Parquet files (no small-file overhead).
 * **Local and cloud from the same code.** `IS_LOCAL=true` → LocalStack endpoint, no SSL; `IS_LOCAL=false` → real AWS S3,
   `sslmode=require` for Aurora, and cloud defaults for the lake bucket and raw-event location. Everything else comes from
-  environment variables. (The workshop's EKS job deploy still needs two changes before it can run this job — see *Cloud deployment status*.) The lake bucket is created on first use in
+  environment variables. The same code has run successfully both locally and as the EKS job in AWS (see *Cloud deployment status*). The lake bucket is created on first use in
   whatever `AWS_REGION` is set (with a `LocationConstraint` outside `us-east-1`, as S3 requires — the VDI uses `ap-south-1`).
 * **Resilience.** S3 and PostgreSQL calls retry with exponential backoff (1s, 2s, 4s, 8s); zero-row sources halt the run
   (`FAIL_ON_EMPTY=true`); a run manifest is written even when the run fails.
@@ -164,12 +170,53 @@ image's own) and psycopg2-binary. `tests/test_requirements.py` keeps that file p
 Useful options: `python job.py --steps silver,gold`, `python job.py --steps reconcile` (audit the lake on its own).
 
 ### Cloud deployment status
-*Checked on 2026-10-15 with read-only AWS calls (region `ap-south-1`).*
+*Updated on 2026-10-15 (region `ap-south-1`).*
 
-**In short:** the pipeline runs fully locally. In AWS, the job on EKS reaches Aurora and S3, has loaded the source
-data into Aurora and reads it back, but it then stopped in its Bronze step because pyarrow could not be imported in the
-job's container (below). That is fixed in `requirements.txt` but not yet deployed. The fix was tested in the job's own
-container image: all tests pass and the full pipeline succeeds there.
+**In short: the pipeline runs locally and in AWS EKS.** On the fourth cloud run, the EKS job ran the whole pipeline
+against Aurora PostgreSQL and the real S3 lake bucket and succeeded: 30/30 reconciliation checks, all 10 Gold tables in
+S3 and in Aurora's `gold` schema. Each of the first three cloud runs failed on a different problem; how each was
+found and fixed is below.
+
+**The successful cloud run**
+* Run `20261015T152846Z-d2be7505`, manifest
+  `s3://coding-workshop-<id>-talent-lake-<id>/_runs/run_date=2026-10-15/20261015T152846Z-d2be7505.json`.
+* `status: success`. Reconciliation: **30 of 30 checks passed** (2 Bronze, 9 Silver, 19 Gold), 0 failed.
+* Duration: **173.7 s** (2 min 54 s), from 15:28:47 to 15:31:40 UTC. By step: seed 13.6 s, Bronze 75.6 s,
+  Silver 32.0 s, Gold 5.1 s, reconcile 46.7 s. Bronze and reconcile take longest because they list and compare the 783
+  learning files in S3.
+* Settings in the manifest: `is_local: false`, no S3 endpoint override (real AWS S3), Aurora with `sslmode=require`,
+  source tables from Aurora, raw events from `<lake>/landing/learning_activity`, Gold also written to PostgreSQL.
+* Seed: `skip`. The source tables were already loaded by the second run's seed step.
+* Bronze learning files: 783 found, 0 copied, 783 unchanged and skipped (an earlier attempt had already copied them;
+  re-runs copy only new or changed files), 1 empty file, 7,302,325 source bytes.
+* Checked afterwards with read-only AWS calls: all 10 Gold folders are under `gold/`, and the manifest in S3 is the same,
+  byte for byte, as the saved copy.
+
+| Table | Bronze rows | Silver rows | Quarantined | Duplicates dropped |
+|---|---|---|---|---|
+| teams | 100 | 100 | 0 | 0 |
+| competencies | 40 | 40 | 0 | 0 |
+| employees | 2,000 | 2,000 | 0 | 0 |
+| projects | 33 | 33 | 0 | 0 |
+| performance_reviews | 4,000 | 4,000 | 0 | 0 |
+| competency_assessments | 4,000 | 4,000 | 0 | 0 |
+| talent_review | 2,000 | 2,000 | 0 | 0 |
+| learning_activity | 29,868 lines in 783 files | 29,574 | 143 (13 malformed + 130 rule failures) | 151 |
+
+| Gold table (S3 `gold/` and Aurora `gold.`) | Rows |
+|---|---|
+| gold_employee_performance | 2,000 |
+| gold_review_history | 4,000 |
+| gold_critical_skill_gaps | 325 |
+| gold_promotion_candidates | 357 |
+| gold_employee_learning | 2,000 |
+| gold_course_completions | 3,421 |
+| gold_attrition_risk | 260 |
+| gold_team_outcomes | 100 |
+| gold_skill_distribution | 400 |
+| gold_employee_360 | 2,000 |
+
+Every count is the same as in the local runs (`docs/TEST_EVIDENCE.md`).
 
 **What is deployed in AWS**
 * The workshop backend (`../bin/deploy-backend.sh`; its Terraform state is in the participant S3 bucket).
@@ -228,7 +275,7 @@ two "destroys" are Terraform `null_resource` steps that just re-run Helm (Jupyte
   column types as before (checked on all 7 source tables and all 183 Gold columns). `tests/test_db.py` repeats the
   container's situation by switching off pandas' SQLAlchemy support.
 
-**What went wrong on the third cloud run (fixed in `requirements.txt`, not yet deployed)**
+**What went wrong on the third cloud run (fixed in `requirements.txt` and deployed — the fourth run succeeded)**
 * Bronze read the first table from Aurora, then failed to write it as Parquet: ``ImportError('`Import pyarrow` failed')``.
   The real error, seen by importing pyarrow in a test pod with the job's image: `pyarrow requires NumPy 2.0 or newer,
   found 1.26.4`.
@@ -265,10 +312,10 @@ two "destroys" are Terraform `null_resource` steps that just re-run Helm (Jupyte
   `IS_LOCAL=false python scripts/upload_source.py` — learning files to `landing/learning_activity`, the seven CSVs and
   `schema.sql` to `landing/source`. Re-runs skip unchanged files.
 
-**Remaining steps:** deploy again with `../bin/deploy-backend.sh` (from `data/`, with `TF_VAR_aws_eks_enabled=true` in
+**Running it again in AWS:** deploy with `../bin/deploy-backend.sh` (from `data/`, with `TF_VAR_aws_eks_enabled=true` in
 `~/.bashrc`; every deploy ships the current `requirements.txt` and `pipeline/` files to the job), then follow the job
-with `kubectl logs -f job/coding-workshop-talent-pipeline`. Still untested: a full run in AWS itself (the whole pipeline
-has run in the job's image locally, but not yet against Aurora and the real lake bucket).
+with `kubectl logs -f job/coding-workshop-talent-pipeline`. Each deploy also shows Aurora losing the tag
+`ams:rt:ams-monitoring-policy` (an in-place change, no replacement), because the organizers add it outside Terraform.
 
 ### Troubleshooting
 | Symptom | Fix |
@@ -317,11 +364,11 @@ The seven PostgreSQL tables passed every contract (0 rejected rows). Overall 294
 * **Attrition score is rule-based** and explainable (`risk_reasons`), not a trained model.
 * **Small samples:** 27 teams have projects (33 projects); department × competency cells average ~10 assessments.
   Correlations are signals to investigate, not proof of cause.
-* **The cloud run is not done yet.** The `IS_LOCAL=false` settings are unit-tested and reading raw events from S3 is
-  integration-tested. The job is deployed on EKS and reaches Aurora and S3, but its last run stopped in Bronze (pyarrow
-  could not be imported in the container); the fix is in `requirements.txt` but not yet deployed (see
-  *Cloud deployment status*). The pipeline was exercised end-to-end locally
-  (PostgreSQL + LocalStack Pro S3, `AWS_REGION=ap-south-1`), not in a live AWS account.
+* **Tested locally and in AWS.** The automated tests run locally (PostgreSQL + LocalStack Pro S3,
+  `AWS_REGION=ap-south-1`). In AWS the pipeline has been run, not unit-tested: one full EKS job run against Aurora and
+  the real S3 bucket succeeded with 30/30 reconciliation and the same row counts as locally (see
+  *Cloud deployment status*). The job image uses the `latest` tag, so if that image changes, the pins in
+  `requirements.txt` may need re-checking.
 * All names in the dataset are synthetic.
 
 ---

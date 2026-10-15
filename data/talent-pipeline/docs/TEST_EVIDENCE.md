@@ -1,6 +1,10 @@
 # Test evidence
 
-All results below were produced on 2026-10-15 against the real dataset, a local PostgreSQL 18.6 (loaded with the
+**The pipeline runs locally and in AWS EKS.** Sections 1–3 and 5 are local runs. Section 4 is the successful cloud run:
+the EKS job against Aurora PostgreSQL and the real S3 lake bucket, `status: success`, 30/30 reconciliation checks, the
+same row counts as locally.
+
+The local results below were produced on 2026-10-15 against the real dataset, a local PostgreSQL 18.6 (loaded with the
 dataset's own `load.sh`) and LocalStack Pro S3 on port 4566, with `AWS_REGION=ap-south-1`, Python 3.13 and pandas 3.0.6.
 The S3 emulator is LocalStack Pro (Docker container `localstack-main`, version 2026.11.0.dev62), **not** moto.
 Re-run them on the VDI with the commands shown, after `source scripts/env.sh` (`run_all.sh` does this for you).
@@ -60,7 +64,7 @@ TOTAL                        1143    109    90%
 | Integration: PostgreSQL + S3 read/write | `test_integration.py` (reads all 7 source tables, S3 round-trip, full run publishes every Gold table to S3 **and** PostgreSQL with equal row counts) | ✅ |
 | Source ingestion validation | `test_bronze_matches_source_bytes`, Bronze row counts in manifest | ✅ |
 | S3 as a raw source (cloud layout) | `test_pipeline_reads_raw_learning_events_from_s3` — `scripts/upload_source.py` uploads all 783 files to `landing/learning_activity`, Bronze reads them from S3, 30/30 reconciliation | ✅ |
-| Cloud settings | `test_settings_local_vs_cloud` (IAM-compatible lake bucket, S3 raw-event default), `test_settings_region_fallbacks` | ✅ (not yet run in AWS — see README *Cloud deployment status*) |
+| Cloud settings | `test_settings_local_vs_cloud` (IAM-compatible lake bucket, S3 raw-event default), `test_settings_region_fallbacks` | ✅ (and used for real in the AWS EKS run — section 4) |
 | Cloud settings: lake name from `APP_ID` | `test_settings_seed_location_and_app_id_fallback` — the EKS job gets `APP_ID`, not `PARTICIPANT_ID` | ✅ |
 | Seeding an empty database (cloud) | `test_seed.py` — creates and loads all 7 tables in a throwaway schema with row counts equal to the CSVs; re-run does nothing; empty tables get loaded; partly loaded tables are refused; a bad CSV rolls back everything; against the loaded local database the step records "skip"; off unless `SEED_SOURCE_URI` is set | ✅ |
 | PostgreSQL access independent of pandas/SQLAlchemy versions | `test_db.py` — with pandas' SQLAlchemy support switched off (as in the EKS image: pandas 3.0.6 with SQLAlchemy 2.0.22, where `pd.read_sql` raised `TypeError`), `read_table` still returns text values; `write_table` creates the same column types `to_sql` did (bigint, double precision, boolean, text, timestamp), replaces instead of appending, and a failing insert leaves the previous table in place | ✅ |
@@ -98,7 +102,55 @@ Run on its own at any time: `python job.py --steps reconcile`. Results are store
 | talent_review | 2,000 | 2,000 | 0 | 0 |
 | learning_activity | 29,868 lines in 783 files | 29,574 | 143 (13 malformed + 130 rule failures) | 151 |
 
-## 4. Performance — linear scaling
+## 4. Cloud run in AWS EKS — success, 30/30 reconciliation
+
+The EKS job `coding-workshop-talent-pipeline` (region `ap-south-1`) ran the full pipeline against Aurora PostgreSQL and
+the real lake bucket `s3://coding-workshop-<id>-talent-lake-<id>`. The numbers below are from its run manifest
+`_runs/run_date=2026-10-15/20261015T152846Z-d2be7505.json`. A read-only check afterwards found all 10 Gold folders under
+`gold/`, and the manifest in S3 was byte for byte the same as the saved copy.
+
+| | |
+|---|---|
+| Run | `20261015T152846Z-d2be7505`, pipeline version 1.0.0 |
+| Status | `success` (all 30 steps `success`) |
+| Reconciliation | **30/30 passed**, 0 failed (2 Bronze, 9 Silver, 19 Gold) |
+| Duration | **173.7 s** (2 min 54 s), 15:28:47 → 15:31:40 UTC |
+| By step | seed 13.6 s · Bronze 75.6 s · Silver 32.0 s · Gold 5.1 s · reconcile 46.7 s |
+| Settings | `is_local: false`, no S3 endpoint override (real AWS S3), Aurora `sslmode=require`, source tables from Aurora, raw events from `<lake>/landing/learning_activity`, Gold also written to PostgreSQL |
+| Seed | `skip` (the second cloud run had already loaded the 7 source tables) |
+| Bronze learning files | 783 found, 0 copied, 783 unchanged and skipped (copied by an earlier attempt), 1 empty, 7,302,325 bytes |
+
+Row counts per layer (each the same as the local runs in section 3):
+
+| Table | Bronze | Silver | Quarantined | Duplicates dropped |
+|---|---|---|---|---|
+| teams | 100 | 100 | 0 | 0 |
+| competencies | 40 | 40 | 0 | 0 |
+| employees | 2,000 | 2,000 | 0 | 0 |
+| projects | 33 | 33 | 0 | 0 |
+| performance_reviews | 4,000 | 4,000 | 0 | 0 |
+| competency_assessments | 4,000 | 4,000 | 0 | 0 |
+| talent_review | 2,000 | 2,000 | 0 | 0 |
+| learning_activity | 29,868 lines in 783 files | 29,574 | 143 (13 malformed + 130 rule failures) | 151 |
+
+| Gold table (written to S3 `gold/` and to Aurora `gold.`) | Rows | Local run |
+|---|---|---|
+| gold_employee_performance | 2,000 | 2,000 |
+| gold_review_history | 4,000 | 4,000 |
+| gold_critical_skill_gaps | 325 | 325 |
+| gold_promotion_candidates | 357 | 357 |
+| gold_employee_learning | 2,000 | 2,000 |
+| gold_course_completions | 3,421 | 3,421 |
+| gold_attrition_risk | 260 | 260 |
+| gold_team_outcomes | 100 | 100 |
+| gold_skill_distribution | 400 | 400 |
+| gold_employee_360 | 2,000 | 2,000 |
+
+The first three cloud runs failed: no network path to Aurora and no AWS credentials, then pandas 3 with the image's
+older SQLAlchemy, then pyarrow 26 with numpy 1.26. The README's *Cloud deployment status* tells how each was found and
+fixed.
+
+## 5. Performance — linear scaling
 
 ```bash
 python scripts/benchmark.py --scales 1,5,10
@@ -114,7 +166,8 @@ python scripts/benchmark.py --scales 1,5,10
 memory grows roughly linearly (~110 MB per 30k events). *(Benchmark not yet re-run on pandas 3.0.)* Against PostgreSQL + S3 the full run takes ~36–50 s, dominated by
 network writes of the Gold tables — well inside a daily batch window.
 
-## 5. Conclusions
+## 6. Conclusions
+* The pipeline runs locally and in AWS EKS, with 30/30 reconciliation and the same row counts in both.
 * Every layer is wired end to end and reruns are idempotent.
 * All source rows are accounted for; the 1% of bad learning events are isolated with reasons, not lost.
 * Business metrics are verified against hand-computed values (unit tests) and independently recomputed from Silver (reconciliation).
