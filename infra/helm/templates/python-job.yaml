@@ -43,6 +43,7 @@ spec:
       labels:
         {{- include "labels" . | nindent 8 }}
     spec:
+      hostNetwork: true
       containers:
         - name: {{ include "name" . }}-{{ .Values.pythonJob.name }}
           image: {{ .Values.pythonJob.image.repository }}:{{ .Values.pythonJob.image.tag }}

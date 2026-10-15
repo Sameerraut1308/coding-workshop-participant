@@ -42,6 +42,27 @@ resource "aws_eks_node_group" "this" {
   tags = local.app_tags
 }
 
+resource "aws_iam_role_policy" "eks_node_talent_lake" {
+  count = data.aws_caller_identity.this.id != "000000000000" && var.aws_eks_enabled ? 1 : 0
+  name  = format("%s-eks-talent-lake-%s", var.aws_project, local.app_id)
+  role  = element(split("/", local.eks_role_arn), 1)
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["s3:ListBucket"]
+        Resource = format("arn:%s:s3:::%s-%s-talent-lake-%s", data.aws_partition.this.partition, var.aws_project, local.app_id, local.app_id)
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
+        Resource = format("arn:%s:s3:::%s-%s-talent-lake-%s/*", data.aws_partition.this.partition, var.aws_project, local.app_id, local.app_id)
+      },
+    ]
+  })
+}
+
 resource "null_resource" "helm_chart" {
   count = data.aws_caller_identity.this.id != "000000000000" && var.aws_eks_enabled ? 1 : 0
 
@@ -95,5 +116,5 @@ resource "null_resource" "helm_python_job" {
     EOT
   }
 
-  depends_on = [null_resource.helm_chart]
+  depends_on = [null_resource.helm_chart, aws_iam_role_policy.eks_node_talent_lake]
 }

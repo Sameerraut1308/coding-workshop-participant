@@ -158,28 +158,53 @@ Useful options: `python job.py --steps silver,gold`, `python job.py --steps reco
 ### Cloud deployment status
 *Checked on 2026-10-15 with read-only AWS calls (region `ap-south-1`).*
 
-**In short:** the pipeline runs fully locally. The cloud run is in progress: it has not run yet, and the steps below are
-what is left.
+**In short:** the pipeline runs fully locally. In AWS, the EKS cluster is up and the job has run once, but that first
+run failed for two reasons (below). Both are fixed in `infra/` but not yet deployed.
 
-**What is already deployed in AWS**
-* The workshop backend (`../bin/deploy-backend.sh` has run; its Terraform state is in the participant S3 bucket).
+**What is deployed in AWS**
+* The workshop backend (`../bin/deploy-backend.sh`; its Terraform state is in the participant S3 bucket).
 * The Aurora PostgreSQL database `coding-workshop-rds-<id>` (status: available).
-* Not yet: the EKS cluster that runs data jobs (it is created once `TF_VAR_aws_eks_enabled=true` is set).
+* The EKS cluster `coding-workshop-<id>` with one worker node, JupyterHub, and the `coding-workshop-talent-pipeline` job.
+* The lake bucket `coding-workshop-<id>-talent-lake-<id>`, already holding the uploaded source data
+  (783 learning files, the seven CSVs and `schema.sql`).
 
 **Why this VDI cannot reach Aurora**
 * The VDI sits in a different private network (a different AWS account) from the database.
-* Aurora's firewall (security group) only lets in machines from its own group. The database port 5432 is not open to anything
-  else. The organizers manage this firewall; it is not part of `infra/`, so it was left alone.
-* So `load.sh` cannot be run from the VDI against Aurora (connection attempts time out). The job's seed step does it instead (below).
+* Aurora's firewall (security group `coding-workshop-<id>`) only lets in machines from that same group. The database port
+  5432 is not open to anything else. The organizers manage this group; it is not part of `infra/`, and the workshop
+  permissions do not allow adding rules to it.
+* So `load.sh` cannot be run from the VDI against Aurora (connection attempts time out). The job's seed step does it
+  instead: `scripts/upload_source.py` uploads the CSVs and `schema.sql` to S3, and the job's first step (`seed`,
+  `pipeline/seed.py`) loads them into Aurora if the source tables are empty. It is safe to re-run: loaded tables are left
+  alone, partly loaded tables stop the job with a clear error, and the load is one transaction, so a failure leaves
+  nothing half-loaded. Locally the step is off.
 
-**Why a job running in EKS could reach it**
-* The EKS worker machines are placed in that same security group (`infra/eks.tf`, `vpc_config`), so the cloud job can
-  connect to Aurora. Loading the source data therefore happens from inside the cloud: `scripts/upload_source.py` uploads
-  the CSVs and `schema.sql` to S3, and the job's first step (`seed`, `pipeline/seed.py`) loads them into Aurora if the
-  source tables are empty. It is safe to re-run: loaded tables are left alone, partly loaded tables stop the job with a
-  clear error, and the load is one transaction, so a failure leaves nothing half-loaded. Locally the step is off.
+**What went wrong on the first cloud run**
+1. **The job could not reach Aurora** (`postgres.connect` timed out). The EKS worker node was **not** in Aurora's
+   security group. `infra/eks.tf` gives that group to the EKS *cluster* (`vpc_config`), which only covers the cluster's
+   control plane. The worker node only gets the security group EKS creates for the cluster (`eks-cluster-sg-…`), and
+   Aurora did not let that group in.
+2. **The job had no AWS credentials** (`NoCredentialsError` on every S3 call). A pod normally borrows the worker node's
+   AWS role through the node's instance metadata service. The node only answers requests that come directly from the
+   machine (hop limit 1), and a normal pod is one network hop further away. On top of that, the node's role had no S3
+   permissions at all.
 
-**Two gaps in the workshop's job deploy (`infra/`) — fixed in code, not yet deployed**
+**The three fixes (in `infra/`, not yet deployed)**
+1. **Aurora also joins the EKS cluster security group** (`infra/rds.tf`). Members of that group may talk to each other,
+   so the worker node can now reach port 5432. Aurora's existing group stays, so nothing else loses access.
+2. **The worker node's role may use the lake bucket, and only that bucket** (`infra/eks.tf`, inline policy
+   `coding-workshop-eks-talent-lake-<id>`): `s3:ListBucket` on the lake bucket, and `s3:GetObject` / `s3:PutObject` /
+   `s3:DeleteObject` on the objects in it. Not the Terraform state bucket, and no wildcards. These four are exactly the S3
+   calls the pipeline makes.
+3. **The job's pod uses the node's network** (`hostNetwork: true` in `infra/helm/templates/python-job.yaml`), so it can
+   reach the instance metadata service and pick up the node role's credentials.
+
+The workshop permissions rule out the other usual fixes: adding firewall rules, giving the node a launch template (needed
+to change its security groups or the hop limit), and IRSA (needs an OIDC provider). The plan for these three fixes:
+3 to add, 2 to change, 2 to destroy. Aurora is changed in place, and no bucket or database is destroyed or replaced. The
+two "destroys" are Terraform `null_resource` steps that just re-run Helm (JupyterHub upgrade and the job itself).
+
+**Earlier gaps in the workshop's job deploy (`infra/`) — fixed and deployed**
 1. **Only `job.py` reaches the job's container.** `infra/helm/templates/python-job.yaml` copies just `job.py` and
    `requirements.txt`, so `from pipeline...` fails with `ModuleNotFoundError`.
    *Fix (done):* every other `.py` file in the job folder (except `tests/`) is copied next to `job.py`
@@ -199,10 +224,10 @@ what is left.
   `IS_LOCAL=false python scripts/upload_source.py` — learning files to `landing/learning_activity`, the seven CSVs and
   `schema.sql` to `landing/source`. Re-runs skip unchanged files.
 
-**Remaining steps:** run the upload above, then `echo "export TF_VAR_aws_eks_enabled=true" >> ~/.bashrc`,
-`source ~/.bashrc`, `../bin/deploy-backend.sh`, and `kubectl logs -f job/coding-workshop-talent-pipeline`. Still untested:
-whether the EKS machines may write to the lake bucket (set by the organizers), and the job's container image
-(`jupyter/all-spark-notebook`, an older Python than the 3.13 used locally).
+**Remaining steps:** deploy the three fixes with `../bin/deploy-backend.sh` (from `data/`, with
+`TF_VAR_aws_eks_enabled=true` in `~/.bashrc`), then follow the job with `kubectl logs -f job/coding-workshop-talent-pipeline`.
+Still untested: a full pipeline run in the job's container image (`jupyter/all-spark-notebook`, an older Python than the
+3.13 used locally), because the first run stopped at its first step.
 
 ### Troubleshooting
 | Symptom | Fix |
@@ -250,8 +275,8 @@ The seven PostgreSQL tables passed every contract (0 rejected rows). Overall 294
 * **Small samples:** 27 teams have projects (33 projects); department × competency cells average ~10 assessments.
   Correlations are signals to investigate, not proof of cause.
 * **The cloud run is not done yet.** The `IS_LOCAL=false` settings are unit-tested and reading raw events from S3 is
-  integration-tested. The two gaps in the EKS job deploy are fixed in code and the seed step loads Aurora from S3, but none
-  of it has been deployed yet, and Aurora cannot be reached from the VDI (see *Cloud deployment status*). The pipeline was exercised end-to-end locally
+  integration-tested. The job is deployed on EKS, but its first run failed (no route to Aurora, no AWS credentials);
+  the fixes are in `infra/` but not yet deployed (see *Cloud deployment status*). The pipeline was exercised end-to-end locally
   (PostgreSQL + LocalStack Pro S3, `AWS_REGION=ap-south-1`), not in a live AWS account.
 * All names in the dataset are synthetic.
 
