@@ -3,6 +3,10 @@ pythonJob:
   name: "python-job"
   scriptContent: ""
   requirementsContent: ""
+  # Extra source files mounted next to job.py: [{path: "pkg/module.py", content: "..."}]
+  files: []
+  # Environment variables for the job, stored in a Kubernetes Secret
+  env: {}
   backoffLimit: 4
   ttlSecondsAfterFinished: 100
   restartPolicy: Never

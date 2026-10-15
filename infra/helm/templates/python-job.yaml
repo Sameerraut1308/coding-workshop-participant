@@ -11,6 +11,24 @@ data:
     {{ .Values.pythonJob.scriptContent | nindent 4 }}
   requirements.txt: |
     {{ .Values.pythonJob.requirementsContent | nindent 4 }}
+  {{- range $i, $f := .Values.pythonJob.files }}
+  file-{{ $i }}: |
+    {{ $f.content | nindent 4 }}
+  {{- end }}
+---
+{{- end }}
+{{- if .Values.pythonJob.env }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "name" . }}-{{ .Values.pythonJob.name }}-env
+  labels:
+    {{- include "labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  {{- range $k, $v := .Values.pythonJob.env }}
+  {{ $k }}: {{ $v | toString | quote }}
+  {{- end }}
 ---
 {{- end }}
 apiVersion: batch/v1
@@ -37,6 +55,11 @@ spec:
                 pip install --no-cache-dir -r /app/requirements.txt
               fi
               python /app/job.py
+          {{- if .Values.pythonJob.env }}
+          envFrom:
+            - secretRef:
+                name: {{ include "name" . }}-{{ .Values.pythonJob.name }}-env
+          {{- end }}
           {{- if .Values.pythonJob.scriptContent }}
           volumeMounts:
             - name: script
@@ -54,6 +77,17 @@ spec:
         - name: script
           configMap:
             name: {{ include "name" . }}-{{ .Values.pythonJob.name }}-source
+            {{- if .Values.pythonJob.files }}
+            items:
+              - key: job.py
+                path: job.py
+              - key: requirements.txt
+                path: requirements.txt
+              {{- range $i, $f := .Values.pythonJob.files }}
+              - key: file-{{ $i }}
+                path: {{ $f.path }}
+              {{- end }}
+            {{- end }}
       {{- end }}
       restartPolicy: {{ .Values.pythonJob.restartPolicy }}
   backoffLimit: {{ .Values.pythonJob.backoffLimit }}

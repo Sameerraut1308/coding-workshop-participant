@@ -75,6 +75,10 @@ resource "null_resource" "helm_python_job" {
   }
 
   provisioner "local-exec" {
+    # Settings travel in an env var (not the command line) so they stay out of the Terraform output
+    environment = {
+      JOB_ENV_JSON = jsonencode(local.env_vars)
+    }
     command = <<-EOT
       helm upgrade --cleanup-on-fail \
         --install ${replace(each.key, "_", "-")}-python-job ./helm/ \
@@ -82,6 +86,11 @@ resource "null_resource" "helm_python_job" {
         --set pythonJob.name=${replace(each.key, "_", "-")} \
         --set-file pythonJob.scriptContent=${each.value.path}/${each.value.file} \
         --set-file pythonJob.requirementsContent=${each.value.path}/${each.value.reqs} \
+        %{for i, f in each.value.modules~}
+        --set 'pythonJob.files[${i}].path=${f}' \
+        --set-file 'pythonJob.files[${i}].content=${each.value.path}/${f}' \
+        %{endfor~}
+        --set-json "pythonJob.env=$JOB_ENV_JSON" \
         --namespace default
     EOT
   }

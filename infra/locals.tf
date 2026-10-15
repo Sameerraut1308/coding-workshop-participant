@@ -74,6 +74,11 @@ locals {
       path = abspath(format("%s/../data/%s", path.module, name))
       file = "job.py"
       reqs = "requirements.txt"
+      # Other Python modules the job imports (tests excluded), shipped next to job.py
+      modules = sort([
+        for f in fileset(format("%s/../data/%s", path.module, name), "**/*.py") :
+        f if f != "job.py" && !startswith(f, "tests/")
+      ])
     }
   }
   data_names_java = {
