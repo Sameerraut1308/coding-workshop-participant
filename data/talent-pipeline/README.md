@@ -10,7 +10,7 @@ notebook that answers the seven business questions with charts and plain-English
 | **Pipeline only** | `python job.py` |
 | **Insights** | `notebooks/talent_insights.ipynb` (pre-rendered copy: `notebooks/talent_insights.html`) |
 | **SQL answers** | `sql/business_questions.sql` (queries the `gold` schema in PostgreSQL) |
-| **Test evidence** | `docs/TEST_EVIDENCE.md` — 64 tests, 98% coverage, 30/30 reconciliation checks |
+| **Test evidence** | `docs/TEST_EVIDENCE.md` — 64 tests, 30/30 reconciliation checks. With integration tests (`RUN_INTEGRATION=1`, needs LocalStack): 64 passed, 98% coverage. Default run (as in `run_all.sh`): 60 passed, 4 skipped, 92% coverage |
 | **Column lineage** | `docs/LINEAGE.md` — source-to-target mapping for every Gold column |
 
 ---
@@ -77,7 +77,7 @@ All Gold tables are built from one conformed table, `gold_employee_360` (one row
   so time-bounded reads touch only the needed folders. Small dimension tables are single Parquet files (no small-file overhead).
 * **Local and cloud from the same code.** `IS_LOCAL=true` → LocalStack endpoint, no SSL; `IS_LOCAL=false` → real AWS S3,
   `sslmode=require` for Aurora, and cloud defaults for the lake bucket and raw-event location. Everything else comes from
-  environment variables. (The workshop's EKS job deploy still needs two changes before it can run this job — see *Cloud mode*.) The lake bucket is created on first use in
+  environment variables. (The workshop's EKS job deploy still needs two changes before it can run this job — see *Cloud deployment status*.) The lake bucket is created on first use in
   whatever `AWS_REGION` is set (with a `LocationConstraint` outside `us-east-1`, as S3 requires — the VDI uses `ap-south-1`).
 * **Resilience.** S3 and PostgreSQL calls retry with exponential backoff (1s, 2s, 4s, 8s); zero-row sources halt the run
   (`FAIL_ON_EMPTY=true`); a run manifest is written even when the run fails.
@@ -152,26 +152,48 @@ pandas 3.0.6 and every business number is unchanged; pin `pandas<3` if you need 
 
 Useful options: `python job.py --steps silver,gold`, `python job.py --steps reconcile` (audit the lake on its own).
 
-### Cloud mode
-**Status: not yet deployable with the workshop's unmodified EKS job chart.** The pipeline side is ready and tested; the
-deploy side has two gaps in `infra/` (shared workshop files, so they are left unchanged pending a decision):
+### Cloud deployment status
+*Checked on 2026-10-15 with read-only AWS calls (region `ap-south-1`).*
 
-1. **Only `job.py` reaches the pod.** `infra/helm/templates/python-job.yaml` mounts just `job.py` and `requirements.txt`
-   from a ConfigMap, so `from pipeline...` fails with `ModuleNotFoundError`. The `pipeline/` modules must be shipped too.
-2. **No environment variables reach the pod.** `locals.env_vars` (`IS_LOCAL`, `POSTGRES_*`, `APP_REGION`) is injected
-   into the Lambdas only; the job template has no `env`. Without them the job would look for PostgreSQL on `localhost`.
+**In short:** the pipeline runs fully locally. The cloud run is in progress: it has not run yet, and the steps below are
+what is left.
 
-What is already in place for cloud runs:
-* `IS_LOCAL=false` → no endpoint override (real S3), `sslmode=require` for Aurora.
-* Lake bucket defaults to `s3://coding-workshop-<id>-talent-lake-<id>`, which the workshop IAM policy allows
-  (`talent-lake-<id>` would be denied). It is created in `AWS_REGION` / `APP_REGION` with the right `LocationConstraint`.
-* Raw events are read from S3 (`<lake>/landing/learning_activity`), because the pod has no dataset folder. Upload them once
-  from the VDI: `IS_LOCAL=false python scripts/upload_source.py` (re-runs skip unchanged files). Reading from S3 is covered
-  by `test_pipeline_reads_raw_learning_events_from_s3` against LocalStack.
-* Aurora must be loaded once with `load.sh`, using the Aurora `POSTGRES_*` values and `IS_LOCAL=false` (SSL).
+**What is already deployed in AWS**
+* The workshop backend (`../bin/deploy-backend.sh` has run; its Terraform state is in the participant S3 bucket).
+* The Aurora PostgreSQL database `coding-workshop-rds-<id>` (status: available).
+* Not yet: the EKS cluster that runs data jobs (it is created once `TF_VAR_aws_eks_enabled=true` is set).
 
-Once the deploy gaps are closed: `echo "export TF_VAR_aws_eks_enabled=true" >> ~/.bashrc`, `source ~/.bashrc`,
-`../bin/deploy-backend.sh`, then `kubectl logs -f job/coding-workshop-talent-pipeline`.
+**Why this VDI cannot reach Aurora**
+* The VDI sits in a different private network (a different AWS account) from the database.
+* Aurora's firewall (security group) only lets in machines from its own group. The database port 5432 is not open to anything
+  else. The organizers manage this firewall; it is not part of `infra/`, so it was left alone.
+* So `load.sh` cannot be run from the VDI against Aurora (connection attempts time out).
+
+**Why a job running in EKS could reach it**
+* The EKS worker machines are placed in that same security group (`infra/eks.tf`, `vpc_config`), so the cloud job can
+  connect to Aurora. Loading the source data therefore has to happen from inside the cloud: upload the CSVs to S3 and
+  let the job load them into Aurora when its tables are empty.
+
+**Two gaps in the workshop's job deploy (`infra/`) and how they would be fixed**
+1. **Only `job.py` reaches the job's container.** `infra/helm/templates/python-job.yaml` copies just `job.py` and
+   `requirements.txt`, so `from pipeline...` fails with `ModuleNotFoundError`.
+   *Fix:* also copy each `pipeline/*.py` file into the container (template change, plus a loop over the files in `infra/eks.tf`).
+2. **No settings reach the job's container.** The workshop's settings (`IS_LOCAL`, `POSTGRES_*`, `APP_REGION` in
+   `locals.env_vars`) are given to the Lambdas only, so the job would look for PostgreSQL on `localhost`.
+   *Fix:* pass `local.env_vars` to the job as a Kubernetes Secret and load it as environment variables (about 10 lines).
+
+**Already in place in the pipeline code**
+* `IS_LOCAL=false` → real S3 (no LocalStack endpoint) and `sslmode=require` for Aurora.
+* The lake bucket defaults to `s3://coding-workshop-<id>-talent-lake-<id>`, a name the workshop permissions allow
+  (`talent-lake-<id>` would be denied). It is created on first use in `AWS_REGION` / `APP_REGION`.
+* Raw events are read from S3 (`<lake>/landing/learning_activity`), because the container has no dataset folder. Upload them
+  once from the VDI: `IS_LOCAL=false python scripts/upload_source.py` (re-runs skip unchanged files). Reading from S3 is
+  covered by `test_pipeline_reads_raw_learning_events_from_s3` against LocalStack.
+
+**Remaining steps:** fix the two gaps, add the load-from-S3 step, then `echo "export TF_VAR_aws_eks_enabled=true" >> ~/.bashrc`,
+`source ~/.bashrc`, `../bin/deploy-backend.sh`, and `kubectl logs -f job/coding-workshop-talent-pipeline`. Still untested:
+whether the EKS machines may write to the lake bucket (set by the organizers), and the job's container image
+(`jupyter/all-spark-notebook`, an older Python than the 3.13 used locally).
 
 ### Troubleshooting
 | Symptom | Fix |
@@ -218,9 +240,10 @@ The seven PostgreSQL tables passed every contract (0 rejected rows). Overall 294
 * **Attrition score is rule-based** and explainable (`risk_reasons`), not a trained model.
 * **Small samples:** 27 teams have projects (33 projects); department × competency cells average ~10 assessments.
   Correlations are signals to investigate, not proof of cause.
-* **Cloud deployment is not done yet.** The `IS_LOCAL=false` settings are unit-tested and reading raw events from S3 is
-  integration-tested, but the workshop's EKS job chart ships neither the `pipeline/` modules nor the env vars (see *Cloud mode*).
-  The pipeline was exercised end-to-end locally (PostgreSQL + LocalStack Pro S3, `AWS_REGION=ap-south-1`), not in a live AWS account.
+* **The cloud run is not done yet.** The `IS_LOCAL=false` settings are unit-tested and reading raw events from S3 is
+  integration-tested, but the workshop's EKS job deploy ships neither the `pipeline/` modules nor the settings, and Aurora
+  cannot be reached from the VDI (see *Cloud deployment status*). The pipeline was exercised end-to-end locally
+  (PostgreSQL + LocalStack Pro S3, `AWS_REGION=ap-south-1`), not in a live AWS account.
 * All names in the dataset are synthetic.
 
 ---
@@ -238,7 +261,7 @@ talent-pipeline/
 │   ├── contracts.py            # schema contracts per table
 │   ├── quality.py              # contract enforcement + quarantine
 │   ├── bronze.py  silver.py  gold.py  reconcile.py
-├── tests/                      # unit, end-to-end, integration (64 tests)
+├── tests/                      # unit, end-to-end, integration (64 tests; 4 need RUN_INTEGRATION=1)
 ├── notebooks/talent_insights.ipynb  (+ .html)
 ├── sql/business_questions.sql
 ├── scripts/run_all.sh  scripts/env.sh  scripts/upload_source.py  scripts/benchmark.py
