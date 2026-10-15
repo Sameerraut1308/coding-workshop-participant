@@ -10,7 +10,7 @@ notebook that answers the seven business questions with charts and plain-English
 | **Pipeline only** | `python job.py` |
 | **Insights** | `notebooks/talent_insights.ipynb` (pre-rendered copy: `notebooks/talent_insights.html`) |
 | **SQL answers** | `sql/business_questions.sql` (queries the `gold` schema in PostgreSQL) |
-| **Test evidence** | `docs/TEST_EVIDENCE.md` — 73 tests, 30/30 reconciliation checks. With integration tests (`RUN_INTEGRATION=1`, needs PostgreSQL + LocalStack): 73 passed, 0 failed, 98% coverage. Default run (as in `run_all.sh`): 65 passed, 8 skipped, 0 failed, 90% coverage. S3 in all local runs is LocalStack Pro on port 4566, not moto |
+| **Test evidence** | `docs/TEST_EVIDENCE.md` — 78 tests, 30/30 reconciliation checks. With integration tests (`RUN_INTEGRATION=1`, needs PostgreSQL + LocalStack): 78 passed, 0 failed, 98% coverage. Default run (as in `run_all.sh`): 68 passed, 10 skipped, 0 failed, 90% coverage. S3 in all local runs is LocalStack Pro on port 4566, not moto |
 | **Column lineage** | `docs/LINEAGE.md` — source-to-target mapping for every Gold column |
 
 ---
@@ -158,8 +158,9 @@ Useful options: `python job.py --steps silver,gold`, `python job.py --steps reco
 ### Cloud deployment status
 *Checked on 2026-10-15 with read-only AWS calls (region `ap-south-1`).*
 
-**In short:** the pipeline runs fully locally. In AWS, the EKS cluster is up and the job has run once, but that first
-run failed for two reasons (below). Both are fixed in `infra/` but not yet deployed.
+**In short:** the pipeline runs fully locally. In AWS, the job on EKS now reaches Aurora and S3 and has loaded the
+source data into Aurora, but it then stopped in its Bronze step because of a pandas/SQLAlchemy version mismatch in the
+job's container (below). That is fixed in `pipeline/db.py` but not yet deployed.
 
 **What is deployed in AWS**
 * The workshop backend (`../bin/deploy-backend.sh`; its Terraform state is in the participant S3 bucket).
@@ -189,7 +190,7 @@ run failed for two reasons (below). Both are fixed in `infra/` but not yet deplo
    machine (hop limit 1), and a normal pod is one network hop further away. On top of that, the node's role had no S3
    permissions at all.
 
-**The three fixes (in `infra/`, not yet deployed)**
+**The three fixes (in `infra/`, deployed — the job then reached Aurora and S3)**
 1. **Aurora also joins the EKS cluster security group** (`infra/rds.tf`). Members of that group may talk to each other,
    so the worker node can now reach port 5432. Aurora's existing group stays, so nothing else loses access.
 2. **The worker node's role may use the lake bucket, and only that bucket** (`infra/eks.tf`, inline policy
@@ -203,6 +204,20 @@ The workshop permissions rule out the other usual fixes: adding firewall rules, 
 to change its security groups or the hop limit), and IRSA (needs an OIDC provider). The plan for these three fixes:
 3 to add, 2 to change, 2 to destroy. Aurora is changed in place, and no bucket or database is destroyed or replaced. The
 two "destroys" are Terraform `null_resource` steps that just re-run Helm (JupyterHub upgrade and the job itself).
+
+**What went wrong on the next cloud run (fixed in code, not yet deployed)**
+* The seed step worked: it created and loaded all seven source tables in Aurora (100 teams, 2,000 employees, 4,000
+  reviews, …), and later attempts correctly skipped it.
+* Bronze then failed on its first table with `TypeError('Query must be a string unless using sqlalchemy.')`. The job's
+  container (`/opt/conda`, Python 3.11) installs `requirements.txt` on top of its own packages. pip upgraded pandas to
+  3.0.6 but kept the image's SQLAlchemy 2.0.22, because `SQLAlchemy>=2.0` was already met. pandas 3 needs SQLAlchemy
+  2.0.36 or newer, and with an older one it acts as if SQLAlchemy were not installed, so `pd.read_sql` rejected the
+  query. Locally SQLAlchemy is 2.1.4, so the problem never showed up here.
+* *Fix:* `pipeline/db.py` no longer uses pandas' SQL helpers. It reads tables with plain SQLAlchemy (`conn.execute`)
+  and builds the DataFrame from the rows itself. It writes Gold tables by dropping, creating and filling them with
+  SQLAlchemy inside one transaction, so a re-run still replaces the table. It produces the same values and the same
+  column types as before (checked on all 7 source tables and all 183 Gold columns). `tests/test_db.py` repeats the
+  container's situation by switching off pandas' SQLAlchemy support.
 
 **Earlier gaps in the workshop's job deploy (`infra/`) — fixed and deployed**
 1. **Only `job.py` reaches the job's container.** `infra/helm/templates/python-job.yaml` copies just `job.py` and
@@ -224,10 +239,10 @@ two "destroys" are Terraform `null_resource` steps that just re-run Helm (Jupyte
   `IS_LOCAL=false python scripts/upload_source.py` — learning files to `landing/learning_activity`, the seven CSVs and
   `schema.sql` to `landing/source`. Re-runs skip unchanged files.
 
-**Remaining steps:** deploy the three fixes with `../bin/deploy-backend.sh` (from `data/`, with
-`TF_VAR_aws_eks_enabled=true` in `~/.bashrc`), then follow the job with `kubectl logs -f job/coding-workshop-talent-pipeline`.
-Still untested: a full pipeline run in the job's container image (`jupyter/all-spark-notebook`, an older Python than the
-3.13 used locally), because the first run stopped at its first step.
+**Remaining steps:** deploy again with `../bin/deploy-backend.sh` (from `data/`, with `TF_VAR_aws_eks_enabled=true` in
+`~/.bashrc`; every deploy ships the current `pipeline/` files to the job), then follow the job with
+`kubectl logs -f job/coding-workshop-talent-pipeline`. Still untested: the steps after Bronze's first table in the job's
+container image (`jupyter/all-spark-notebook`, Python 3.11 instead of the 3.13 used locally).
 
 ### Troubleshooting
 | Symptom | Fix |
@@ -238,6 +253,7 @@ Still untested: a full pipeline run in the job's container image (`jupyter/all-s
 | `POSTGRES_* <unset>` / `fe_sendauth: no password supplied` | `source scripts/env.sh` (run_all.sh does this); override any `POSTGRES_*` value by exporting it |
 | `IllegalLocationConstraintException` on `CreateBucket` | Fixed in `storage.py` (bucket is created in `AWS_REGION`); pull the latest code |
 | Notebook fails with `ImportError` from `.../python3.14/...` | Kernel ran on another Python — use `python -m nbconvert` / `python -m notebook`, as `run_all.sh` does |
+| `TypeError: Query must be a string unless using sqlalchemy` (EKS job) | Old `pipeline/db.py`: pandas 3 with SQLAlchemy < 2.0.36 ignores SQLAlchemy. Fixed in `db.py`; deploy again |
 | `relation "teams" does not exist` | Run `load.sh` (step 2) |
 | `relation already exists` when re-running `load.sh` | Data is already loaded — skip step 2 |
 | Reconciliation check failed | Read the `reconciliation failed` log line; it names the table and the expected vs actual counts |
@@ -275,8 +291,9 @@ The seven PostgreSQL tables passed every contract (0 rejected rows). Overall 294
 * **Small samples:** 27 teams have projects (33 projects); department × competency cells average ~10 assessments.
   Correlations are signals to investigate, not proof of cause.
 * **The cloud run is not done yet.** The `IS_LOCAL=false` settings are unit-tested and reading raw events from S3 is
-  integration-tested. The job is deployed on EKS, but its first run failed (no route to Aurora, no AWS credentials);
-  the fixes are in `infra/` but not yet deployed (see *Cloud deployment status*). The pipeline was exercised end-to-end locally
+  integration-tested. The job is deployed on EKS and reaches Aurora and S3, but its last run stopped in Bronze (a
+  pandas/SQLAlchemy mismatch in the container); the fix is in `pipeline/db.py` but not yet deployed (see
+  *Cloud deployment status*). The pipeline was exercised end-to-end locally
   (PostgreSQL + LocalStack Pro S3, `AWS_REGION=ap-south-1`), not in a live AWS account.
 * All names in the dataset are synthetic.
 
@@ -296,7 +313,7 @@ talent-pipeline/
 │   ├── quality.py              # contract enforcement + quarantine
 │   ├── seed.py                 # cloud only: load source CSVs into an empty database
 │   ├── bronze.py  silver.py  gold.py  reconcile.py
-├── tests/                      # unit, end-to-end, integration (73 tests; 8 need RUN_INTEGRATION=1)
+├── tests/                      # unit, end-to-end, integration (78 tests; 10 need RUN_INTEGRATION=1)
 ├── notebooks/talent_insights.ipynb  (+ .html)
 ├── sql/business_questions.sql
 ├── scripts/run_all.sh  scripts/env.sh  scripts/upload_source.py  scripts/benchmark.py

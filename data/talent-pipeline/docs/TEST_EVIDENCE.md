@@ -5,20 +5,21 @@ dataset's own `load.sh`) and LocalStack Pro S3 on port 4566, with `AWS_REGION=ap
 The S3 emulator is LocalStack Pro (Docker container `localstack-main`, version 2026.11.0.dev62), **not** moto.
 Re-run them on the VDI with the commands shown, after `source scripts/env.sh` (`run_all.sh` does this for you).
 
-## 1. Automated tests — 73 passed, 0 failed, 0 skipped, 98% coverage
+## 1. Automated tests — 78 passed, 0 failed, 0 skipped, 98% coverage
 
 ```bash
 RUN_INTEGRATION=1 python -m pytest -v --cov=pipeline --cov=job
 ```
 
 ```
-tests/test_end_to_end.py .........                                       [ 12%]
-tests/test_gold.py .............                                         [ 30%]
-tests/test_integration.py ....                                           [ 35%]
-tests/test_observability.py ........                                     [ 46%]
-tests/test_quality.py ...................                                [ 72%]
-tests/test_seed.py .........                                             [ 84%]
-tests/test_silver.py .....                                               [ 91%]
+tests/test_db.py .....                                                   [  6%]
+tests/test_end_to_end.py .........                                       [ 17%]
+tests/test_gold.py .............                                         [ 34%]
+tests/test_integration.py ....                                           [ 39%]
+tests/test_observability.py ........                                     [ 50%]
+tests/test_quality.py ...................                                [ 74%]
+tests/test_seed.py .........                                             [ 85%]
+tests/test_silver.py .....                                               [ 92%]
 tests/test_storage.py ......                                             [100%]
 Name                        Stmts   Miss  Cover
 -----------------------------------------------
@@ -27,7 +28,7 @@ pipeline/__init__.py            1      0   100%
 pipeline/bronze.py             80      6    92%
 pipeline/config.py             72      0   100%
 pipeline/contracts.py          31      0   100%
-pipeline/db.py                 35      2    94%
+pipeline/db.py                 71      3    96%
 pipeline/gold.py              207      1    99%
 pipeline/observability.py      97      0   100%
 pipeline/quality.py            83      0   100%
@@ -36,19 +37,19 @@ pipeline/seed.py               69      1    99%
 pipeline/silver.py            133      2    98%
 pipeline/storage.py           156      5    97%
 -----------------------------------------------
-TOTAL                        1107     21    98%
-73 passed, 1 warning in 86.81s (0:01:26)
+TOTAL                        1143     22    98%
+78 passed, 1 warning in 74.81s (0:01:14)
 ```
 
 The one warning is a `SyntaxWarning` raised inside the system `pytz` package (`/usr/lib/python3/dist-packages`), not in
 this project's code.
 
-Default run, as `bash scripts/run_all.sh` does it (no `RUN_INTEGRATION`; the 8 PostgreSQL/LocalStack tests are skipped).
+Default run, as `bash scripts/run_all.sh` does it (no `RUN_INTEGRATION`; the 10 PostgreSQL/LocalStack tests are skipped).
 In the same run the pipeline finished with `status: success` and 30/30 reconciliation checks, and the notebook executed:
 
 ```
-TOTAL                        1107    107    90%
-65 passed, 8 skipped, 1 warning in 11.82s
+TOTAL                        1143    109    90%
+68 passed, 10 skipped, 1 warning in 11.93s
 ```
 
 | Guide requirement | Covered by | Result |
@@ -61,6 +62,7 @@ TOTAL                        1107    107    90%
 | Cloud settings | `test_settings_local_vs_cloud` (IAM-compatible lake bucket, S3 raw-event default), `test_settings_region_fallbacks` | ✅ (not yet run in AWS — see README *Cloud deployment status*) |
 | Cloud settings: lake name from `APP_ID` | `test_settings_seed_location_and_app_id_fallback` — the EKS job gets `APP_ID`, not `PARTICIPANT_ID` | ✅ |
 | Seeding an empty database (cloud) | `test_seed.py` — creates and loads all 7 tables in a throwaway schema with row counts equal to the CSVs; re-run does nothing; empty tables get loaded; partly loaded tables are refused; a bad CSV rolls back everything; against the loaded local database the step records "skip"; off unless `SEED_SOURCE_URI` is set | ✅ |
+| PostgreSQL access independent of pandas/SQLAlchemy versions | `test_db.py` — with pandas' SQLAlchemy support switched off (as in the EKS image: pandas 3.0.6 with SQLAlchemy 2.0.22, where `pd.read_sql` raised `TypeError`), `read_table` still returns text values; `write_table` creates the same column types `to_sql` did (bigint, double precision, boolean, text, timestamp), replaces instead of appending, and a failing insert leaves the previous table in place | ✅ |
 | Uploading the cloud inputs | `test_upload_source_uploads_tables_and_learning_files_once` — CSVs, `schema.sql` and learning files uploaded once; re-run uploads nothing; a missing CSV is reported | ✅ |
 | Data quality validation (quarantine) | `test_quarantine_contains_reasons` | ✅ |
 | Idempotency (run twice, no duplicates) | `test_rerun_is_idempotent` — every output identical; 2nd run copies 0 raw files (the test picks the newest run manifest by file time, since two runs can share a one-second `run_id` stamp) | ✅ |

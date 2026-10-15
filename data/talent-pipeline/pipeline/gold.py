@@ -395,7 +395,7 @@ def build_gold(s: dict[str, pd.DataFrame], as_of: str) -> dict[str, pd.DataFrame
 
 
 def _postgres_ready(df: pd.DataFrame) -> pd.DataFrame:
-    """Convert pandas nullable/extension dtypes to plain types for ``to_sql``."""
+    """Convert pandas nullable/extension dtypes to plain types for ``db.write_table``."""
     out = df.copy()
     for col in out.columns:
         dtype = out[col].dtype
