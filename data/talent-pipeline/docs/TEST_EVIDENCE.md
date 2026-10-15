@@ -5,7 +5,7 @@ dataset's own `load.sh`) and LocalStack Pro S3 on port 4566, with `AWS_REGION=ap
 The S3 emulator is LocalStack Pro (Docker container `localstack-main`, version 2026.11.0.dev62), **not** moto.
 Re-run them on the VDI with the commands shown, after `source scripts/env.sh` (`run_all.sh` does this for you).
 
-## 1. Automated tests — 78 passed, 0 failed, 0 skipped, 98% coverage
+## 1. Automated tests — 81 passed, 0 failed, 0 skipped, 98% coverage
 
 ```bash
 RUN_INTEGRATION=1 python -m pytest -v --cov=pipeline --cov=job
@@ -14,11 +14,12 @@ RUN_INTEGRATION=1 python -m pytest -v --cov=pipeline --cov=job
 ```
 tests/test_db.py .....                                                   [  6%]
 tests/test_end_to_end.py .........                                       [ 17%]
-tests/test_gold.py .............                                         [ 34%]
-tests/test_integration.py ....                                           [ 39%]
-tests/test_observability.py ........                                     [ 50%]
-tests/test_quality.py ...................                                [ 74%]
-tests/test_seed.py .........                                             [ 85%]
+tests/test_gold.py .............                                         [ 33%]
+tests/test_integration.py ....                                           [ 38%]
+tests/test_observability.py ........                                     [ 48%]
+tests/test_quality.py ...................                                [ 71%]
+tests/test_requirements.py ...                                           [ 75%]
+tests/test_seed.py .........                                             [ 86%]
 tests/test_silver.py .....                                               [ 92%]
 tests/test_storage.py ......                                             [100%]
 Name                        Stmts   Miss  Cover
@@ -38,7 +39,7 @@ pipeline/silver.py            133      2    98%
 pipeline/storage.py           156      5    97%
 -----------------------------------------------
 TOTAL                        1143     22    98%
-78 passed, 1 warning in 74.81s (0:01:14)
+81 passed, 1 warning in 80.81s (0:01:20)
 ```
 
 The one warning is a `SyntaxWarning` raised inside the system `pytz` package (`/usr/lib/python3/dist-packages`), not in
@@ -49,7 +50,7 @@ In the same run the pipeline finished with `status: success` and 30/30 reconcili
 
 ```
 TOTAL                        1143    109    90%
-68 passed, 10 skipped, 1 warning in 11.93s
+71 passed, 10 skipped, 1 warning in 12.54s
 ```
 
 | Guide requirement | Covered by | Result |
@@ -63,6 +64,7 @@ TOTAL                        1143    109    90%
 | Cloud settings: lake name from `APP_ID` | `test_settings_seed_location_and_app_id_fallback` — the EKS job gets `APP_ID`, not `PARTICIPANT_ID` | ✅ |
 | Seeding an empty database (cloud) | `test_seed.py` — creates and loads all 7 tables in a throwaway schema with row counts equal to the CSVs; re-run does nothing; empty tables get loaded; partly loaded tables are refused; a bad CSV rolls back everything; against the loaded local database the step records "skip"; off unless `SEED_SOURCE_URI` is set | ✅ |
 | PostgreSQL access independent of pandas/SQLAlchemy versions | `test_db.py` — with pandas' SQLAlchemy support switched off (as in the EKS image: pandas 3.0.6 with SQLAlchemy 2.0.22, where `pd.read_sql` raised `TypeError`), `read_table` still returns text values; `write_table` creates the same column types `to_sql` did (bigint, double precision, boolean, text, timestamp), replaces instead of appending, and a failing insert leaves the previous table in place | ✅ |
+| Job dependencies work in the job's container image | In `jupyter/all-spark-notebook` (Python 3.11.6, run locally with Docker): `pip install -r requirements.txt` replaces only pandas (→ 2.2.3) and pyarrow (→ 17.0.0) and keeps numpy 1.24.4; pyarrow imports and writes Parquet; `RUN_INTEGRATION=1 python -m pytest` 78 passed (before `test_requirements.py` existed) and `python job.py` succeeded with 30/30 reconciliation; Gold tables identical row for row to the local pandas 3.0.6 run. `test_requirements.py` keeps `requirements.txt` pinned, runtime-only and covering every import of the job | ✅ |
 | Uploading the cloud inputs | `test_upload_source_uploads_tables_and_learning_files_once` — CSVs, `schema.sql` and learning files uploaded once; re-run uploads nothing; a missing CSV is reported | ✅ |
 | Data quality validation (quarantine) | `test_quarantine_contains_reasons` | ✅ |
 | Idempotency (run twice, no duplicates) | `test_rerun_is_idempotent` — every output identical; 2nd run copies 0 raw files (the test picks the newest run manifest by file time, since two runs can share a one-second `run_id` stamp) | ✅ |

@@ -10,7 +10,7 @@ notebook that answers the seven business questions with charts and plain-English
 | **Pipeline only** | `python job.py` |
 | **Insights** | `notebooks/talent_insights.ipynb` (pre-rendered copy: `notebooks/talent_insights.html`) |
 | **SQL answers** | `sql/business_questions.sql` (queries the `gold` schema in PostgreSQL) |
-| **Test evidence** | `docs/TEST_EVIDENCE.md` — 78 tests, 30/30 reconciliation checks. With integration tests (`RUN_INTEGRATION=1`, needs PostgreSQL + LocalStack): 78 passed, 0 failed, 98% coverage. Default run (as in `run_all.sh`): 68 passed, 10 skipped, 0 failed, 90% coverage. S3 in all local runs is LocalStack Pro on port 4566, not moto |
+| **Test evidence** | `docs/TEST_EVIDENCE.md` — 81 tests, 30/30 reconciliation checks. With integration tests (`RUN_INTEGRATION=1`, needs PostgreSQL + LocalStack): 81 passed, 0 failed, 98% coverage. Default run (as in `run_all.sh`): 71 passed, 10 skipped, 0 failed, 90% coverage. S3 in all local runs is LocalStack Pro on port 4566, not moto |
 | **Column lineage** | `docs/LINEAGE.md` — source-to-target mapping for every Gold column |
 
 ---
@@ -110,7 +110,8 @@ cd ~/coding-workshop-participant/data/talent-pipeline
 source scripts/env.sh
 
 # 1. Install dependencies into the same interpreter that runs the scripts
-python -m pip install --user -r requirements.txt
+#    (requirements-dev.txt: pipeline + notebook + test tools; requirements.txt is only for the EKS job)
+python -m pip install --user -r requirements-dev.txt
 
 # 2. Load the source data into PostgreSQL (once)
 bash ~/data-engineering-performance-talent-management/load.sh
@@ -133,6 +134,13 @@ to a different Python version than the one the requirements were installed into.
 
 **pandas 3.** `pandas>=2.2` currently installs pandas 3.0.x. The pipeline, all tests and the notebook were re-run on
 pandas 3.0.6 and every business number is unchanged; pin `pandas<3` if you need the 2.x behaviour.
+
+**Two requirements files.** `requirements-dev.txt` is for working on this folder (loose versions, plus Jupyter,
+matplotlib, pytest and moto). `requirements.txt` is what the EKS job installs: the workshop deploy only ships a file
+with exactly that name, and the job runs `pip install -r requirements.txt` on top of its container image
+(`jupyter/all-spark-notebook`: Python 3.11, numpy 1.24.4). It pins the six runtime packages to versions tested
+together in that image: numpy 1.24.4 (the image's own), pandas 2.2.3, pyarrow 17.0.0, boto3, SQLAlchemy 2.0.22 (the
+image's own) and psycopg2-binary. `tests/test_requirements.py` keeps that file pinned and free of dev tools.
 
 ### Configuration (environment variables)
 
@@ -158,9 +166,10 @@ Useful options: `python job.py --steps silver,gold`, `python job.py --steps reco
 ### Cloud deployment status
 *Checked on 2026-10-15 with read-only AWS calls (region `ap-south-1`).*
 
-**In short:** the pipeline runs fully locally. In AWS, the job on EKS now reaches Aurora and S3 and has loaded the
-source data into Aurora, but it then stopped in its Bronze step because of a pandas/SQLAlchemy version mismatch in the
-job's container (below). That is fixed in `pipeline/db.py` but not yet deployed.
+**In short:** the pipeline runs fully locally. In AWS, the job on EKS reaches Aurora and S3, has loaded the source
+data into Aurora and reads it back, but it then stopped in its Bronze step because pyarrow could not be imported in the
+job's container (below). That is fixed in `requirements.txt` but not yet deployed. The fix was tested in the job's own
+container image: all tests pass and the full pipeline succeeds there.
 
 **What is deployed in AWS**
 * The workshop backend (`../bin/deploy-backend.sh`; its Terraform state is in the participant S3 bucket).
@@ -205,7 +214,7 @@ to change its security groups or the hop limit), and IRSA (needs an OIDC provide
 3 to add, 2 to change, 2 to destroy. Aurora is changed in place, and no bucket or database is destroyed or replaced. The
 two "destroys" are Terraform `null_resource` steps that just re-run Helm (JupyterHub upgrade and the job itself).
 
-**What went wrong on the next cloud run (fixed in code, not yet deployed)**
+**What went wrong on the second cloud run (fixed and deployed)**
 * The seed step worked: it created and loaded all seven source tables in Aurora (100 teams, 2,000 employees, 4,000
   reviews, …), and later attempts correctly skipped it.
 * Bronze then failed on its first table with `TypeError('Query must be a string unless using sqlalchemy.')`. The job's
@@ -218,6 +227,23 @@ two "destroys" are Terraform `null_resource` steps that just re-run Helm (Jupyte
   SQLAlchemy inside one transaction, so a re-run still replaces the table. It produces the same values and the same
   column types as before (checked on all 7 source tables and all 183 Gold columns). `tests/test_db.py` repeats the
   container's situation by switching off pandas' SQLAlchemy support.
+
+**What went wrong on the third cloud run (fixed in `requirements.txt`, not yet deployed)**
+* Bronze read the first table from Aurora, then failed to write it as Parquet: ``ImportError('`Import pyarrow` failed')``.
+  The real error, seen by importing pyarrow in a test pod with the job's image: `pyarrow requires NumPy 2.0 or newer,
+  found 1.26.4`.
+* Why: the old `requirements.txt` had loose versions and also the notebook and test tools. pip installed pyarrow 26
+  (which needs numpy 2 but does not say so in its package metadata), while the image's matplotlib dependencies held
+  numpy below 2, so pip picked numpy 1.26.4. That pair cannot work together.
+* *Fix:* `requirements.txt` now holds only the six packages the job imports, pinned to versions tested together in
+  the job's image (numpy 1.24.4 and SQLAlchemy 2.0.22 as shipped in the image, pandas 2.2.3, pyarrow 17.0.0, boto3,
+  psycopg2-binary). In that image, pip then only replaces pandas and pyarrow and leaves numpy alone, so the image's own
+  numba / numexpr / bottleneck keep working. The notebook and test tools moved to `requirements-dev.txt`, which the
+  deploy does not ship.
+* *Checked in the job image* (`jupyter/all-spark-notebook`, run locally with Docker against the local PostgreSQL and
+  LocalStack): `RUN_INTEGRATION=1 python -m pytest` 78 passed (before `tests/test_requirements.py` was added), and
+  `python job.py` succeeded with 30/30 reconciliation checks. Its Gold tables are identical, row for row, to a local
+  run with pandas 3.0.6.
 
 **Earlier gaps in the workshop's job deploy (`infra/`) — fixed and deployed**
 1. **Only `job.py` reaches the job's container.** `infra/helm/templates/python-job.yaml` copies just `job.py` and
@@ -240,9 +266,9 @@ two "destroys" are Terraform `null_resource` steps that just re-run Helm (Jupyte
   `schema.sql` to `landing/source`. Re-runs skip unchanged files.
 
 **Remaining steps:** deploy again with `../bin/deploy-backend.sh` (from `data/`, with `TF_VAR_aws_eks_enabled=true` in
-`~/.bashrc`; every deploy ships the current `pipeline/` files to the job), then follow the job with
-`kubectl logs -f job/coding-workshop-talent-pipeline`. Still untested: the steps after Bronze's first table in the job's
-container image (`jupyter/all-spark-notebook`, Python 3.11 instead of the 3.13 used locally).
+`~/.bashrc`; every deploy ships the current `requirements.txt` and `pipeline/` files to the job), then follow the job
+with `kubectl logs -f job/coding-workshop-talent-pipeline`. Still untested: a full run in AWS itself (the whole pipeline
+has run in the job's image locally, but not yet against Aurora and the real lake bucket).
 
 ### Troubleshooting
 | Symptom | Fix |
@@ -253,6 +279,7 @@ container image (`jupyter/all-spark-notebook`, Python 3.11 instead of the 3.13 u
 | `POSTGRES_* <unset>` / `fe_sendauth: no password supplied` | `source scripts/env.sh` (run_all.sh does this); override any `POSTGRES_*` value by exporting it |
 | `IllegalLocationConstraintException` on `CreateBucket` | Fixed in `storage.py` (bucket is created in `AWS_REGION`); pull the latest code |
 | Notebook fails with `ImportError` from `.../python3.14/...` | Kernel ran on another Python — use `python -m nbconvert` / `python -m notebook`, as `run_all.sh` does |
+| ``ImportError: `Import pyarrow` failed`` (EKS job) | Old `requirements.txt` let pip pair pyarrow 26 with numpy 1.26 (real error: `pyarrow requires NumPy 2.0 or newer`). Fixed: `requirements.txt` pins versions tested in the job image; deploy again |
 | `TypeError: Query must be a string unless using sqlalchemy` (EKS job) | Old `pipeline/db.py`: pandas 3 with SQLAlchemy < 2.0.36 ignores SQLAlchemy. Fixed in `db.py`; deploy again |
 | `relation "teams" does not exist` | Run `load.sh` (step 2) |
 | `relation already exists` when re-running `load.sh` | Data is already loaded — skip step 2 |
@@ -291,8 +318,8 @@ The seven PostgreSQL tables passed every contract (0 rejected rows). Overall 294
 * **Small samples:** 27 teams have projects (33 projects); department × competency cells average ~10 assessments.
   Correlations are signals to investigate, not proof of cause.
 * **The cloud run is not done yet.** The `IS_LOCAL=false` settings are unit-tested and reading raw events from S3 is
-  integration-tested. The job is deployed on EKS and reaches Aurora and S3, but its last run stopped in Bronze (a
-  pandas/SQLAlchemy mismatch in the container); the fix is in `pipeline/db.py` but not yet deployed (see
+  integration-tested. The job is deployed on EKS and reaches Aurora and S3, but its last run stopped in Bronze (pyarrow
+  could not be imported in the container); the fix is in `requirements.txt` but not yet deployed (see
   *Cloud deployment status*). The pipeline was exercised end-to-end locally
   (PostgreSQL + LocalStack Pro S3, `AWS_REGION=ap-south-1`), not in a live AWS account.
 * All names in the dataset are synthetic.
@@ -313,9 +340,11 @@ talent-pipeline/
 │   ├── quality.py              # contract enforcement + quarantine
 │   ├── seed.py                 # cloud only: load source CSVs into an empty database
 │   ├── bronze.py  silver.py  gold.py  reconcile.py
-├── tests/                      # unit, end-to-end, integration (78 tests; 10 need RUN_INTEGRATION=1)
+├── tests/                      # unit, end-to-end, integration (81 tests; 10 need RUN_INTEGRATION=1)
 ├── notebooks/talent_insights.ipynb  (+ .html)
 ├── sql/business_questions.sql
+├── requirements.txt            # EKS job runtime only (pinned for its image)
+├── requirements-dev.txt        # local development: pipeline + notebook + test tools
 ├── scripts/run_all.sh  scripts/env.sh  scripts/upload_source.py  scripts/benchmark.py
 └── docs/TEST_EVIDENCE.md  docs/LINEAGE.md
 ```
