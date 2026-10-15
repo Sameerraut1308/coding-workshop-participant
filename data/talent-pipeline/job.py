@@ -2,13 +2,16 @@
 
 Usage::
 
-    python job.py                         # bronze -> silver -> gold -> reconcile
+    python job.py                         # seed -> bronze -> silver -> gold -> reconcile
     python job.py --steps silver,gold     # run selected steps only
     python job.py --run-date 2026-10-15   # reprocess a specific logical date
 
 Exit code is 0 on success and 1 on any failure; a run manifest (metrics for
 every step plus reconciliation results) is always written to
 ``<lake>/_runs/run_date=<date>/<run_id>.json``.
+
+The ``seed`` step only does something when ``SEED_SOURCE_URI`` is set (the cloud default): it loads
+the source CSVs into PostgreSQL if the source tables are empty (see ``pipeline/seed.py``).
 """
 
 from __future__ import annotations
@@ -24,10 +27,11 @@ from pipeline.config import load_settings  # noqa: E402
 from pipeline.gold import run_gold  # noqa: E402
 from pipeline.observability import RunTracker, get_logger, setup_logging  # noqa: E402
 from pipeline.reconcile import run_reconcile  # noqa: E402
+from pipeline.seed import run_seed  # noqa: E402
 from pipeline.silver import run_silver  # noqa: E402
 from pipeline.storage import open_lake  # noqa: E402
 
-ALL_STEPS = ("bronze", "silver", "gold", "reconcile")
+ALL_STEPS = ("seed", "bronze", "silver", "gold", "reconcile")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -57,6 +61,8 @@ def main(argv: list[str] | None = None) -> int:
     exit_code = 0
     try:
         lake = open_lake(settings)
+        if "seed" in args.steps:
+            run_seed(settings, tracker)
         if "bronze" in args.steps:
             run_bronze(settings, lake, tracker)
         if "silver" in args.steps:

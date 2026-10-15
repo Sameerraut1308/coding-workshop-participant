@@ -29,6 +29,8 @@ DEFAULT_SOURCE_DIR = str(Path.home() / "data-engineering-performance-talent-mana
 
 # Raw learning events live under this prefix of the lake bucket in the cloud (uploaded by scripts/upload_source.py).
 LANDING_LEARNING_PREFIX = "landing/learning_activity"
+# Source CSVs + schema.sql used to seed an empty cloud database (uploaded by scripts/upload_source.py).
+LANDING_SOURCE_PREFIX = "landing/source"
 
 
 def default_lake_uri(participant: str, is_local: bool) -> str:
@@ -75,6 +77,7 @@ class Settings:
     source_mode: str  # "postgres" (default) or "csv" (offline / tests)
     source_dir: str  # folder holding the CSVs (csv mode)
     learning_activity_uri: str  # folder or s3://bucket/prefix with year=/month=/day= files
+    seed_source_uri: str  # folder or s3://... with <table>.csv + schema.sql; "" = never seed PostgreSQL
 
     # PostgreSQL connection.
     pg_host: str
@@ -111,6 +114,7 @@ class Settings:
             "s3_endpoint_url": self.s3_endpoint_url,
             "source_mode": self.source_mode,
             "learning_activity_uri": self.learning_activity_uri,
+            "seed_source_uri": self.seed_source_uri,
             "pg_host": self.pg_host,
             "pg_port": self.pg_port,
             "pg_name": self.pg_name,
@@ -132,12 +136,15 @@ def load_settings(run_date: str | None = None) -> Settings:
     * ``SOURCE_DIR`` - dataset folder (default ``~/data-engineering-performance-talent-management``).
     * ``LEARNING_ACTIVITY_URI`` - default ``$SOURCE_DIR/learning_activity`` locally and
       ``<lake>/landing/learning_activity`` in the cloud (the pod has no copy of the dataset folder).
+    * ``SEED_SOURCE_URI`` - where the seed step finds the source CSVs to load into an empty database:
+      off locally (``load.sh`` does it), ``<lake>/landing/source`` in the cloud (Aurora is unreachable from the VDI).
+    * ``PARTICIPANT_ID`` - names the default lake; falls back to ``APP_ID`` (what the workshop gives the EKS job).
     * ``AWS_REGION`` - falls back to ``AWS_DEFAULT_REGION``, then ``APP_REGION`` (workshop-injected), then us-east-1.
     * ``POSTGRES_HOST/PORT/NAME/USER/PASS`` - injected by the workshop environment.
     * ``RUN_DATE`` - logical run date (``YYYY-MM-DD``), default today (UTC).
     """
     is_local = _env_bool("IS_LOCAL", True)
-    participant = _env_str("PARTICIPANT_ID", "local")
+    participant = _env_str("PARTICIPANT_ID") or _env_str("APP_ID", "local")
     resolved_run_date = run_date or _env_str("RUN_DATE", date.today().isoformat())
     datetime.strptime(resolved_run_date, "%Y-%m-%d")  # fail fast on a bad date
 
@@ -149,8 +156,10 @@ def load_settings(run_date: str | None = None) -> Settings:
     lake_uri = _env_str("DATA_LAKE_URI", default_lake_uri(participant, is_local))
     if is_local:
         default_learning = str(Path(source_dir) / "learning_activity")
+        default_seed = ""
     else:
         default_learning = f"{lake_uri.rstrip('/')}/{LANDING_LEARNING_PREFIX}"
+        default_seed = f"{lake_uri.rstrip('/')}/{LANDING_SOURCE_PREFIX}"
 
     run_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return Settings(
@@ -164,6 +173,7 @@ def load_settings(run_date: str | None = None) -> Settings:
         source_mode=_env_str("SOURCE_MODE", "postgres").lower(),
         source_dir=source_dir,
         learning_activity_uri=_env_str("LEARNING_ACTIVITY_URI", default_learning),
+        seed_source_uri=_env_str("SEED_SOURCE_URI", default_seed),
         pg_host=_env_str("POSTGRES_HOST", "localhost"),
         pg_port=int(_env_str("POSTGRES_PORT", "5432")),
         pg_name=_env_str("POSTGRES_NAME", "postgres"),
